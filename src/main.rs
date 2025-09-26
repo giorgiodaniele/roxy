@@ -29,50 +29,22 @@ impl ProxyServer {
         Ok(ProxyServer { sock })
     }
 
-    fn http_processing(host: String, port: String, cstream: TcpStream, first_req: Vec<u8>) -> Result<(), ProxyError> {
+    fn run(host: String, port: String, mut cstream: TcpStream, https: bool, first_req: Vec<u8>) -> Result<(), ProxyError> {
         // Connect remote server
         let mut sstream = TcpStream::connect(format!("{}:{}", host, port))
             .map_err(|_| ProxyError::SocketCreateError)?;
 
-        // Send the first HTTP request (already read from client) to the server
-        sstream
-            .write_all(&first_req)
-            .map_err(|_| ProxyError::SocketWriteError)?;
-
-        // Clone streams for bidirectional forwarding
-        let mut cstream_clone = cstream.try_clone().map_err(|_| ProxyError::CloneError)?;
-        let mut sstream_clone = sstream.try_clone().map_err(|_| ProxyError::CloneError)?;
-
-        // Forward client → server in a separate thread
-        let c2s = thread::spawn(move || {
-            let _ = std::io::copy(&mut cstream_clone, &mut sstream_clone);
-        });
-
-        // Clone again for server → client
-        let mut cstream_clone = cstream.try_clone().map_err(|_| ProxyError::CloneError)?;
-        let mut sstream_clone = sstream.try_clone().map_err(|_| ProxyError::CloneError)?;
-
-        // Forward server → client (in current thread)
-        let s2c = thread::spawn(move || {
-            let _ = std::io::copy(&mut sstream_clone, &mut cstream_clone);
-        });
-
-        // Await threads
-        c2s.join().map_err(|_| ProxyError::ThreadError)?;
-        s2c.join().map_err(|_| ProxyError::ThreadError)?;
-
-        Ok(())
-    }
-
-    fn https_processing(host: String, port: String, mut cstream: TcpStream) -> Result<(), ProxyError> {
-        // Connect remote server
-        let sstream = TcpStream::connect(format!("{}:{}", host, port))
-            .map_err(|_| ProxyError::SocketCreateError)?;
-
-        // Send the client the tunnel is ready
-        cstream
-            .write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            .map_err(|_| ProxyError::SocketWriteError)?;
+        if https == false {
+            // Send the first HTTP request (already read from client) to the server
+            sstream
+                .write_all(&first_req)
+                .map_err(|_| ProxyError::SocketWriteError)?;
+        } else {
+            // Send the client the tunnel is ready
+            cstream
+                .write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .map_err(|_| ProxyError::SocketWriteError)?;
+        }
 
         // Clone streams for bidirectional forwarding
         let mut cstream_clone = cstream.try_clone().map_err(|_| ProxyError::CloneError)?;
@@ -118,6 +90,7 @@ impl ProxyServer {
         let met = head.split(" ").nth(0).ok_or(ProxyError::ParsingError)?;
         let url = head.split(" ").nth(1).ok_or(ProxyError::ParsingError)?;
 
+
         match met {
             // HTTP
             "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" => {
@@ -125,10 +98,11 @@ impl ProxyServer {
                 let host = info.host_str().ok_or(ProxyError::ParsingError)?;
                 let port  = info.port_or_known_default().ok_or(ProxyError::ParsingError)?;
 
-                ProxyServer::http_processing(
+                ProxyServer::run(
                     host.to_string(),
                     port.to_string(),
                     stream,
+                    false,
                     buffer[..bytes_read].to_vec())?;
             }
 
@@ -137,11 +111,13 @@ impl ProxyServer {
                 let mut parts = url.split(':');
                 let host = parts.next().ok_or(ProxyError::ParsingError)?;
                 let port = parts.next().ok_or(ProxyError::ParsingError)?;
-
-                ProxyServer::https_processing(
+                
+                ProxyServer::run(
                     host.to_string(),
                     port.to_string(),
-                    stream,)?;
+                    stream,
+                    true,
+                    buffer[..bytes_read].to_vec())?;
             }
 
             _ => return Err(ProxyError::ParsingError),
@@ -160,9 +136,7 @@ impl ProxyServer {
                         if let Err(_err) = server_ref.process(stream) {}
                     });
                 }
-                Err(e) => {
-                    return Err(ProxyError::SocketListenError);
-                }
+                Err(e) => { return Err(ProxyError::SocketListenError); }
             }
         }
         Ok(())
