@@ -4,6 +4,7 @@ use std::{
     sync::Arc, thread,
 };
 
+use clap::Parser;
 use url::Url;
 
 #[derive(Debug)]
@@ -126,7 +127,6 @@ impl ProxyServer {
         Ok(())
     }
 
-
     pub fn listen(self: Arc<Self>) -> Result<(), ProxyError> {
         for res in self.sock.incoming() {
             match res {
@@ -143,8 +143,25 @@ impl ProxyServer {
     }
 }
 
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// IP address
+    address: String,
+
+    /// TCP port
+    port: String,
+}
+
 fn main() -> Result<(), ProxyError> {
-    let server = Arc::new(ProxyServer::new("127.0.0.1:9999".to_string())?);
+
+    // Get arguments
+    let args = Args::parse();
+    // Create a new server
+    let server = Arc::new(ProxyServer::new(format!("{}:{}", args.address, args.port))?);
+    // Set the server to listen
     server.listen()?;
+    
     Ok(())
 }
