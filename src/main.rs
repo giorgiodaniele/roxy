@@ -63,25 +63,30 @@ impl ProxyServer {
     }
 
     pub fn process(&self, mut stream: TcpStream) -> Result<(), ProxyError> {
+
+        // Read the initial request from the client
         let mut buffer = [0; 4096];
         let bytes_read = stream
             .read(&mut buffer)
             .map_err(|_| ProxyError::SocketReadError)?;
 
+        // Convert the request to a string for parsing
         let req = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
         let head = req
             .split("\r\n")
             .next()
             .ok_or(ProxyError::ParsingError)?;
 
+        // Get the method and the URL the client is requesting
         let met = head.split(" ").nth(0).ok_or(ProxyError::ParsingError)?;
         let url = head.split(" ").nth(1).ok_or(ProxyError::ParsingError)?;
 
         match met {
+            // HTTP request with full URL
             "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" => {
-                let info = Url::parse(url).map_err(|_| ProxyError::ParsingError)?;
+                let info  = Url::parse(url).map_err(|_| ProxyError::ParsingError)?;
                 let host = info.host_str().ok_or(ProxyError::ParsingError)?;
-                let port = info.port_or_known_default().ok_or(ProxyError::ParsingError)?;
+                let port  = info.port_or_known_default().ok_or(ProxyError::ParsingError)?;
                 println!("[HTTP] {} {} (host={},port={})", met, url, host, port);
 
                 ProxyServer::run(
@@ -89,23 +94,23 @@ impl ProxyServer {
                     port.to_string(),
                     stream,
                     false,
-                    buffer[..bytes_read].to_vec(),
-                )?;
+                    buffer[..bytes_read].to_vec())?;
             }
 
+            // HTTPS CONNECT request
             "CONNECT" => {
                 let mut parts = url.split(':');
                 let host = parts.next().ok_or(ProxyError::ParsingError)?;
                 let port = parts.next().ok_or(ProxyError::ParsingError)?;
                 println!("[HTTPS] {} {} (host={},port={})", met, url, host, port);
 
+                // after this, just tunnel raw data (don’t parse again)
                 ProxyServer::run(
                     host.to_string(),
                     port.to_string(),
                     stream,
                     true,
-                    buffer[..bytes_read].to_vec(),
-                )?;
+                    buffer[..bytes_read].to_vec())?;
             }
 
             _ => {
