@@ -1,18 +1,33 @@
-use std::{sync::Arc};
+use std::{fmt, sync::Arc};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use url::Url;
 
+/// Proxy errors that keep their underlying causes for better debugging
 #[derive(Debug)]
 enum ProxyError {
-    SocketCreateError,
-    SocketListenError,
-    ParsingError,
-    SocketWriteError,
-    SocketReadError,
+    SocketCreateError(std::io::Error),
+    SocketListenError(std::io::Error),
+    ParsingError(String),
+    SocketWriteError(std::io::Error),
+    SocketReadError(std::io::Error),
 }
+
+impl fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProxyError::SocketCreateError(e) => write!(f, "Failed to create/connect socket: {}", e),
+            ProxyError::SocketListenError(e) => write!(f, "Failed to accept connection: {}", e),
+            ProxyError::ParsingError(msg)   => write!(f, "Failed to parse request: {}", msg),
+            ProxyError::SocketWriteError(e)  => write!(f, "Failed to write to socket: {}", e),
+            ProxyError::SocketReadError(e)   => write!(f, "Failed to read from socket: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ProxyError {}
 
 struct ProxyServer {
     sock: TcpListener,
@@ -23,33 +38,32 @@ impl ProxyServer {
         println!("[+] Creating proxy server on {}", address);
         let sock = TcpListener::bind(address)
             .await
-            .map_err(|_| ProxyError::SocketCreateError)?;
+            .map_err(ProxyError::SocketCreateError)?;
         Ok(ProxyServer { sock })
     }
 
     async fn run(host: String, port: String, mut cstream: TcpStream, https: bool, first_req: Vec<u8>) -> Result<(), ProxyError> {
 
-        // Bi-directional copy until EOF on either side
         let mut sstream = TcpStream::connect(format!("{}:{}", host, port))
             .await
-            .map_err(|_| ProxyError::SocketCreateError)?;
+            .map_err(ProxyError::SocketCreateError)?;
 
         if !https {
             sstream
                 .write_all(&first_req)
                 .await
-                .map_err(|_| ProxyError::SocketWriteError)?;
+                .map_err(ProxyError::SocketWriteError)?;
         } else {
             cstream
                 .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 .await
-                .map_err(|_| ProxyError::SocketWriteError)?;
+                .map_err(ProxyError::SocketWriteError)?;
         }
 
         // Bi-directional copy between client and server
         tokio::io::copy_bidirectional(&mut cstream, &mut sstream)
             .await
-            .map_err(|_| ProxyError::SocketReadError)?;
+            .map_err(ProxyError::SocketReadError)?;
 
         Ok(())
     }
@@ -59,20 +73,47 @@ impl ProxyServer {
         let bytes_read = stream
             .read(&mut buffer)
             .await
-            .map_err(|_| ProxyError::SocketReadError)?;
+            .map_err(ProxyError::SocketReadError)?;
+
+        if bytes_read == 0 {
+            return Err(ProxyError::SocketReadError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Client closed connection",
+            )));
+        }
 
         let req = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
-        let head = req.split("\r\n").next().ok_or(ProxyError::ParsingError)?;
 
-        let met = head.split(" ").nth(0).ok_or(ProxyError::ParsingError)?;
-        let url = head.split(" ").nth(1).ok_or(ProxyError::ParsingError)?;
+        // Get the request head
+        let head = req
+            .split("\r\n")
+            .next()
+            .ok_or_else(|| ProxyError::ParsingError("Missing request head".into()))?;
+
+        // Get method
+        let met = head
+            .split(" ")
+            .nth(0)
+            .ok_or_else(|| ProxyError::ParsingError("Missing HTTP method".into()))?;
+
+        // Get the URL
+        let url = head
+            .split(" ")
+            .nth(1)
+            .ok_or_else(|| ProxyError::ParsingError("Missing URL".into()))?;
 
         match met {
             "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" => {
-                let info = Url::parse(url).map_err(|_| ProxyError::ParsingError)?;
-                let host = info.host_str().ok_or(ProxyError::ParsingError)?;
-                let port = info.port_or_known_default().ok_or(ProxyError::ParsingError)?;
-                println!("[HTTP] {} {} (host={},port={})", met, url, host, port);
+
+                let info = Url::parse(url)
+                    .map_err(|e| ProxyError::ParsingError(format!("Bad URL '{}': {}", url, e)))?;
+                let host = info
+                    .host_str()
+                    .ok_or_else(|| ProxyError::ParsingError("Missing host".into()))?;
+                let port = info
+                    .port_or_known_default()
+                    .ok_or_else(|| ProxyError::ParsingError("Missing port".into()))?;
+                println!("[HTTP] {} {} (host={}, port={})", met, url, host, port);
 
                 ProxyServer::run(
                     host.to_string(),
@@ -86,23 +127,32 @@ impl ProxyServer {
 
             "CONNECT" => {
                 let mut parts = url.split(':');
-                let host = parts.next().ok_or(ProxyError::ParsingError)?;
-                let port = parts.next().ok_or(ProxyError::ParsingError)?;
-                println!("[HTTPS] {} {} (host={},port={})", met, url, host, port);
+
+                // Get the host
+                let host = parts
+                    .next()
+                    .ok_or_else(|| ProxyError::ParsingError("Missing CONNECT host".into()))?;
+
+                // Get the port
+                let port = parts
+                    .next()
+                    .ok_or_else(|| ProxyError::ParsingError("Missing CONNECT port".into()))?;
+
+                println!("[HTTPS] {} {} (host={}, port={})", met, url, host, port);
 
                 ProxyServer::run(
                     host.to_string(),
                     port.to_string(),
                     stream,
                     true,
-                    buffer[..bytes_read].to_vec(),
-                )
-                .await?;
+                    buffer[..bytes_read].to_vec()).await?;
             }
 
             _ => {
-                println!("[!] Unknown method: {}", met);
-                return Err(ProxyError::ParsingError);
+                return Err(ProxyError::ParsingError(format!(
+                    "Unknown HTTP method: {}",
+                    met
+                )));
             }
         }
 
@@ -112,11 +162,17 @@ impl ProxyServer {
     pub async fn listen(self: Arc<Self>) -> Result<(), ProxyError> {
         println!("[+] Listening for incoming connections...");
         loop {
-            let (stream, _) = self.sock.accept().await.map_err(|_| ProxyError::SocketListenError)?;
+            let (stream, _) = self
+                .sock
+                .accept()
+                .await
+                .map_err(ProxyError::SocketListenError)?;
+
+
             let server_ref = Arc::clone(&self);
             tokio::spawn(async move {
                 if let Err(err) = server_ref.process(stream).await {
-                    println!("[!] Error processing connection: {:?}", err);
+                    eprintln!("[!] Error processing connection: {}", err);
                 }
             });
         }
